@@ -1,230 +1,298 @@
 #pragma once
-
 #include "kmer_t.hpp"
 #include <upcxx/upcxx.hpp>
 #include <vector>
-#include <memory>
+#include <map>
+#include <algorithm>
+#include <queue>
 
-struct HashMap {
-    // Each rank stores a portion of the hash table
-    std::vector<kmer_pair> data;
-    std::vector<int> used;
+const size_t BATCH_SIZE = 1024;
 
-    // Size of the local portion
-    size_t my_size;
+struct HashMapPart {
+    // Use raw arrays for better performance
+    upcxx::global_ptr<kmer_pair> data;
+    upcxx::global_ptr<int> used;
+    size_t size;
+
+    // Need an explicit constructor since we can't use default constructor
+    HashMapPart() : data(nullptr), used(nullptr), size(0) {}
     
-    // Global size of the hash table (across all ranks)
-    size_t global_size;
-    
-    // Distributed object to access the hash table from any rank
-    upcxx::dist_object<HashMap*> distributed_map;
-
-    size_t size() const noexcept;
-    size_t global_table_size() const noexcept;
-
-    HashMap(size_t size);
-    ~HashMap();
-
-    // Insert a k-mer into the distributed hash map
-    bool insert(const kmer_pair& kmer);
-    
-    // Find a k-mer in the distributed hash map
-    bool find(const pkmer_t& key_kmer, kmer_pair& val_kmer);
-
-    // Helper functions
-    void write_slot(uint64_t slot, const kmer_pair& kmer);
-    kmer_pair read_slot(uint64_t slot);
-    bool request_slot(uint64_t slot);
-    bool slot_used(uint64_t slot);
-    
-    // Distributed hash map functions
-    uint64_t get_target_rank(const pkmer_t& kmer);
-    uint64_t get_target_rank(uint64_t hash);
-    uint64_t get_local_slot(uint64_t hash);
-    
-    // Remote operations via RPC
-    bool remote_insert(const kmer_pair& kmer);
-    bool remote_find(const pkmer_t& key_kmer, kmer_pair& val_kmer);
+    // Buffer for batched operations
+    std::vector<std::pair<int, kmer_pair>> insertion_buffer;
 };
 
-HashMap::HashMap(size_t size) : distributed_map(this) {
-    // Size per rank is total size divided by number of ranks
-    my_size = (size + upcxx::rank_n() - 1) / upcxx::rank_n(); // Ceiling division
-    global_size = my_size * upcxx::rank_n();
+struct HashMap {
+    upcxx::dist_object<HashMapPart> distributed_map;
+    size_t my_size;
+    size_t global_size;
+    upcxx::atomic_domain<int> ad_int;
     
-    data.resize(my_size);
-    used.resize(my_size, 0);
-}
-
-HashMap::~HashMap() {
-    // Nothing special needed for cleanup
-}
-
-bool HashMap::insert(const kmer_pair& kmer) {
-    uint64_t hash = kmer.hash();
-    uint64_t target_rank = get_target_rank(hash);
-    
-    // If the target rank is this rank, do a local insert
-    if (target_rank == upcxx::rank_me()) {
-        uint64_t probe = 0;
-        bool success = false;
-        do {
-            uint64_t slot = get_local_slot(hash + probe++);
-            success = request_slot(slot);
-            if (success) {
-                write_slot(slot, kmer);
-            }
-        } while (!success && probe < my_size);
-        return success;
-    } else {
-        // Otherwise, perform a remote insert using RPC
-        return remote_insert(kmer);
+    HashMap(size_t size) 
+        : distributed_map(HashMapPart()),
+          ad_int({upcxx::atomic_op::compare_exchange, upcxx::atomic_op::load}) {
+        
+        // Initialize my part of the hash table
+        my_size = (size + upcxx::rank_n() - 1) / upcxx::rank_n(); // Ceiling division
+        
+        auto local_data = upcxx::new_array<kmer_pair>(my_size);
+        auto local_used = upcxx::new_array<int>(my_size);
+        
+        // Initialize usage flags
+        for (size_t i = 0; i < my_size; i++) {
+            local_used.local()[i] = 0;
+        }
+        
+        // Set up the distributed map
+        distributed_map->data = local_data;
+        distributed_map->used = local_used;
+        distributed_map->size = my_size;
+        distributed_map->insertion_buffer.reserve(BATCH_SIZE);
+        
+        // Calculate total size - use non-blocking reduction but wait for result
+        global_size = upcxx::reduce_all(my_size, upcxx::op_fast_add).wait();
     }
-}
-
-bool HashMap::find(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
-    uint64_t hash = key_kmer.hash();
-    uint64_t target_rank = get_target_rank(hash);
     
-    // If the target rank is this rank, do a local find
-    if (target_rank == upcxx::rank_me()) {
-        uint64_t probe = 0;
-        bool success = false;
-        do {
-            uint64_t slot = get_local_slot(hash + probe++);
-            if (slot_used(slot)) {
-                val_kmer = read_slot(slot);
-                if (val_kmer.kmer == key_kmer) {
-                    success = true;
+    ~HashMap() {
+        // Clean up allocated memory
+        if (distributed_map->data) upcxx::delete_array(distributed_map->data);
+        if (distributed_map->used) upcxx::delete_array(distributed_map->used);
+    }
+    
+    // Process any pending communication
+    void progress() {
+        upcxx::progress();
+    }
+    
+    bool insert(const kmer_pair& kmer) {
+        uint64_t hash = kmer.hash();
+        int target_rank = hash % upcxx::rank_n();
+        
+        // Process communication occasionally
+        if (distributed_map->insertion_buffer.size() % 64 == 0) {
+            progress();
+        }
+        
+        if (target_rank == upcxx::rank_me()) {
+            // Local insertion
+            uint64_t start_slot = (hash / upcxx::rank_n()) % my_size;
+            
+            // Linear probing
+            for (uint64_t probe = 0; probe < my_size; probe++) {
+                uint64_t slot = (start_slot + probe) % my_size;
+                
+                // Try to claim the slot atomically - use blocking operation
+                int prev = ad_int.compare_exchange(
+                    distributed_map->used + slot, 0, 1, 
+                    std::memory_order_relaxed
+                ).wait();
+                
+                if (prev == 0) {
+                    // Slot was empty, write the k-mer
+                    distributed_map->data.local()[slot] = kmer;
+                    return true;
                 }
-            } else {
-                // If slot is not used, no need to continue
-                break;
             }
-        } while (!success && probe < my_size);
-        return success;
-    } else {
-        // Otherwise, perform a remote find using RPC
-        return remote_find(key_kmer, val_kmer);
-    }
-}
-
-bool HashMap::slot_used(uint64_t slot) { 
-    return used[slot] != 0; 
-}
-
-void HashMap::write_slot(uint64_t slot, const kmer_pair& kmer) { 
-    data[slot] = kmer; 
-}
-
-kmer_pair HashMap::read_slot(uint64_t slot) { 
-    return data[slot]; 
-}
-
-bool HashMap::request_slot(uint64_t slot) {
-    if (used[slot] != 0) {
-        return false;
-    } else {
-        used[slot] = 1;
-        return true;
-    }
-}
-
-size_t HashMap::size() const noexcept { 
-    return my_size; 
-}
-
-size_t HashMap::global_table_size() const noexcept {
-    return global_size;
-}
-
-uint64_t HashMap::get_target_rank(const pkmer_t& kmer) {
-    return get_target_rank(kmer.hash());
-}
-
-uint64_t HashMap::get_target_rank(uint64_t hash) {
-    // Simple distribution: hash modulo number of ranks
-    return hash % upcxx::rank_n();
-}
-
-uint64_t HashMap::get_local_slot(uint64_t hash) {
-    // Get the slot in the local portion of the table
-    // Using just the modulo ensures better distribution
-    return hash % my_size;
-}
-
-bool HashMap::remote_insert(const kmer_pair& kmer) {
-    uint64_t hash = kmer.hash();
-    uint64_t target_rank = get_target_rank(hash);
-    
-    // Use RPC to insert the k-mer on the target rank
-    return upcxx::rpc(
-        target_rank,
-        [](upcxx::dist_object<HashMap*>& distributed_map, kmer_pair kmer) {
-            // Get the local HashMap pointer on the target rank
-            HashMap* local_map = *distributed_map;
+            return false; // Table is full
+        } else {
+            // Buffer for remote insertion
+            distributed_map->insertion_buffer.push_back({target_rank, kmer});
             
-            // Perform a local insert on the target rank
-            uint64_t hash = kmer.hash();
-            uint64_t probe = 0;
-            bool success = false;
-            do {
-                uint64_t slot = local_map->get_local_slot(hash + probe++);
-                success = local_map->request_slot(slot);
-                if (success) {
-                    local_map->write_slot(slot, kmer);
+            // Flush when buffer is full
+            if (distributed_map->insertion_buffer.size() >= BATCH_SIZE) {
+                flush_insertion_buffer();
+            }
+            return true;
+        }
+    }
+    
+    void flush_insertion_buffer() {
+        auto& buffer = distributed_map->insertion_buffer;
+        if (buffer.empty()) return;
+        
+        // Sort by target rank to optimize communication
+        std::sort(buffer.begin(), buffer.end(),
+                 [](const auto& a, const auto& b) { return a.first < b.first; });
+        
+        // Group insertions by rank
+        int current_rank = -1;
+        std::vector<kmer_pair> current_batch;
+        
+        for (const auto& [rank, kmer] : buffer) {
+            if (rank != current_rank) {
+                // Send previous batch if exists
+                if (!current_batch.empty()) {
+                    send_batch_to_rank(current_rank, current_batch);
+                    current_batch.clear();
                 }
-            } while (!success && probe < local_map->size());
-            
-            return success;
-        },
-        distributed_map,
-        kmer
-    ).wait();
-}
-
-bool HashMap::remote_find(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
-    uint64_t hash = key_kmer.hash();
-    uint64_t target_rank = get_target_rank(hash);
+                current_rank = rank;
+            }
+            current_batch.push_back(kmer);
+        }
+        
+        // Send the last batch
+        if (!current_batch.empty()) {
+            send_batch_to_rank(current_rank, current_batch);
+        }
+        
+        buffer.clear();
+    }
     
-    // Use RPC to find the k-mer on the target rank
-    auto result = upcxx::rpc(
-        target_rank,
-        [](upcxx::dist_object<HashMap*>& distributed_map, pkmer_t key_kmer) {
-            // Get the local HashMap pointer on the target rank
-            HashMap* local_map = *distributed_map;
-            
-            // Perform a local find on the target rank
-            uint64_t hash = key_kmer.hash();
-            uint64_t probe = 0;
-            bool success = false;
-            kmer_pair found_kmer;
-            
-            do {
-                uint64_t slot = local_map->get_local_slot(hash + probe++);
-                if (local_map->slot_used(slot)) {
-                    found_kmer = local_map->read_slot(slot);
-                    if (found_kmer.kmer == key_kmer) {
-                        success = true;
+    void send_batch_to_rank(int rank, const std::vector<kmer_pair>& kmers) {
+        // Use fire-and-forget RPC for better performance
+        upcxx::rpc_ff(rank,
+            [](upcxx::dist_object<HashMapPart>& dmap, std::vector<kmer_pair> batch) {
+                for (const auto& kmer : batch) {
+                    uint64_t hash = kmer.hash();
+                    uint64_t start_slot = (hash / upcxx::rank_n()) % dmap->size;
+                    
+                    // Try to find an empty slot
+                    for (uint64_t probe = 0; probe < dmap->size; probe++) {
+                        uint64_t slot = (start_slot + probe) % dmap->size;
+                        if (dmap->used.local()[slot] == 0) {
+                            // Found empty slot
+                            dmap->used.local()[slot] = 1;
+                            dmap->data.local()[slot] = kmer;
+                            break;
+                        }
                     }
-                } else {
-                    // If slot is not used, no need to continue
-                    break;
                 }
-            } while (!success && probe < local_map->size());
-            
-            // Return a pair containing success status and the k-mer (if found)
-            return std::make_pair(success, success ? found_kmer : kmer_pair());
-        },
-        distributed_map,
-        key_kmer
-    ).wait();
-    
-    // Process the result
-    bool success = result.first;
-    if (success) {
-        val_kmer = result.second;
+            },
+            distributed_map, kmers
+        );
     }
     
-    return success;
-}
+    // Find a key with potential to overlap computation and communication
+    bool find(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
+        uint64_t hash = key_kmer.hash();
+        int target_rank = hash % upcxx::rank_n();
+        
+        // Process any pending communication
+        progress();
+        
+        if (target_rank == upcxx::rank_me()) {
+            // Local lookup
+            uint64_t start_slot = (hash / upcxx::rank_n()) % my_size;
+            
+            for (uint64_t probe = 0; probe < my_size; probe++) {
+                uint64_t slot = (start_slot + probe) % my_size;
+                
+                // Check if slot is used
+                if (distributed_map->used.local()[slot] == 0) {
+                    return false; // Empty slot, k-mer not found
+                }
+                
+                // Check if this is our k-mer
+                const kmer_pair& current = distributed_map->data.local()[slot];
+                if (current.kmer == key_kmer) {
+                    val_kmer = current;
+                    return true;
+                }
+            }
+            return false; // Not found
+        } else {
+            // Remote lookup using RPC
+            auto result = upcxx::rpc(target_rank,
+                [](upcxx::dist_object<HashMapPart>& dmap, pkmer_t key) -> std::pair<bool, kmer_pair> {
+                    uint64_t hash = key.hash();
+                    uint64_t start_slot = (hash / upcxx::rank_n()) % dmap->size;
+                    
+                    for (uint64_t probe = 0; probe < dmap->size; probe++) {
+                        uint64_t slot = (start_slot + probe) % dmap->size;
+                        
+                        if (dmap->used.local()[slot] == 0) {
+                            return {false, kmer_pair()}; // Not found
+                        }
+                        
+                        const kmer_pair& current = dmap->data.local()[slot];
+                        if (current.kmer == key) {
+                            return {true, current};
+                        }
+                    }
+                    return {false, kmer_pair()}; // Not found
+                },
+                distributed_map, key_kmer
+            ).wait();
+            
+            if (result.first) {
+                val_kmer = result.second;
+                return true;
+            }
+            return false;
+        }
+    }
+    
+    // Perform a batch of finds without waiting for each one
+    // Use a callback to process results when they're ready
+    template<typename Callback>
+    void find_batch(const std::vector<pkmer_t>& keys, Callback callback) {
+        // Group keys by target rank
+        std::map<int, std::vector<pkmer_t>> grouped_keys;
+        
+        for (const auto& key : keys) {
+            uint64_t hash = key.hash();
+            int target_rank = hash % upcxx::rank_n();
+            
+            if (target_rank == upcxx::rank_me()) {
+                // Process local lookups immediately
+                kmer_pair value;
+                bool found = find(key, value);
+                callback(key, found, value);
+            } else {
+                // Group remote lookups by rank
+                grouped_keys[target_rank].push_back(key);
+            }
+        }
+        
+        // Send batch RPCs for each group
+        for (const auto& [rank, rank_keys] : grouped_keys) {
+            // Fire off non-blocking RPC for this batch
+            upcxx::rpc(rank,
+                [](upcxx::dist_object<HashMapPart>& dmap, std::vector<pkmer_t> batch_keys) 
+                    -> std::vector<std::pair<pkmer_t, std::pair<bool, kmer_pair>>> {
+                    
+                    std::vector<std::pair<pkmer_t, std::pair<bool, kmer_pair>>> results;
+                    results.reserve(batch_keys.size());
+                    
+                    for (const auto& key : batch_keys) {
+                        uint64_t hash = key.hash();
+                        uint64_t start_slot = (hash / upcxx::rank_n()) % dmap->size;
+                        bool found = false;
+                        kmer_pair value;
+                        
+                        for (uint64_t probe = 0; probe < dmap->size; probe++) {
+                            uint64_t slot = (start_slot + probe) % dmap->size;
+                            
+                            if (dmap->used.local()[slot] == 0) {
+                                break; // Not found
+                            }
+                            
+                            const kmer_pair& current = dmap->data.local()[slot];
+                            if (current.kmer == key) {
+                                found = true;
+                                value = current;
+                                break;
+                            }
+                        }
+                        
+                        results.push_back({key, {found, value}});
+                    }
+                    
+                    return results;
+                },
+                distributed_map, rank_keys
+            ).then([callback](std::vector<std::pair<pkmer_t, std::pair<bool, kmer_pair>>> results) {
+                // Process each result from the batch
+                for (const auto& [key, result] : results) {
+                    callback(key, result.first, result.second);
+                }
+            });
+        }
+    }
+    
+    void flush_insertions() {
+        flush_insertion_buffer();
+        upcxx::barrier();
+    }
+    
+    size_t size() const noexcept { return global_size; }
+};
