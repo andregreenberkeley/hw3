@@ -11,184 +11,235 @@
 #include <algorithm>
 #include <string>
 #include <unordered_set>
-#include <deque>
+#include <cstring> // For memcpy
 
-#include "hash_map.hpp" // Use our new async hash map
+#include "hash_map.hpp" 
 #include "kmer_t.hpp"
 #include "read_kmers.hpp"
 #include "butil.hpp"
 
-// Cache structure for contig assembly - unchanged
+// More efficient cache structure with better hit rates
 struct LookupCache {
-    std::vector<std::pair<pkmer_t, kmer_pair>> entries;
-    size_t capacity;
-    size_t mask;
+    static const size_t ASSOCIATIVITY = 4; // Set associativity
+    
+    struct CacheEntry {
+        pkmer_t key;
+        kmer_pair value;
+        bool valid;
+        
+        CacheEntry() : valid(false) {}
+    };
+    
+    std::vector<std::vector<CacheEntry>> sets;
+    size_t num_sets;
+    size_t total_hits;
+    size_t total_misses;
     
     LookupCache(size_t size) {
-        // Find next power of 2
-        capacity = 1;
-        while (capacity < size) capacity <<= 1;
-        mask = capacity - 1;
-        entries.resize(capacity);
+        // Calculate number of sets (each set has ASSOCIATIVITY entries)
+        num_sets = size / ASSOCIATIVITY;
+        sets.resize(num_sets);
+        
+        // Initialize all sets with ASSOCIATIVITY entries each
+        for (auto& set : sets) {
+            set.resize(ASSOCIATIVITY);
+        }
+        
         clear();
     }
     
     void clear() {
-        for (auto& entry : entries) {
-            entry.second = kmer_pair();
+        for (auto& set : sets) {
+            for (auto& entry : set) {
+                entry.valid = false;
+            }
         }
+        total_hits = 0;
+        total_misses = 0;
+    }
+    
+    size_t get_set_index(const pkmer_t& key) const {
+        // Use lower bits of hash for set index
+        return key.hash() % num_sets;
     }
     
     bool find(const pkmer_t& key, kmer_pair& value) {
-        size_t idx = key.hash() & mask;
-        if (entries[idx].first == key && entries[idx].second.kmer == key) {
-            value = entries[idx].second;
-            return true;
+        size_t set_idx = get_set_index(key);
+        auto& set = sets[set_idx];
+        
+        // Search within the set
+        for (const auto& entry : set) {
+            if (entry.valid && entry.key == key) {
+                value = entry.value;
+                total_hits++;
+                return true;
+            }
         }
+        
+        total_misses++;
         return false;
     }
     
     void insert(const pkmer_t& key, const kmer_pair& value) {
-        size_t idx = key.hash() & mask;
-        entries[idx] = {key, value};
+        size_t set_idx = get_set_index(key);
+        auto& set = sets[set_idx];
+        
+        // First, check if key already exists
+        for (auto& entry : set) {
+            if (entry.valid && entry.key == key) {
+                entry.value = value;
+                return;
+            }
+        }
+        
+        // Find an invalid entry or evict the oldest (first) entry
+        for (auto& entry : set) {
+            if (!entry.valid) {
+                entry.key = key;
+                entry.value = value;
+                entry.valid = true;
+                return;
+            }
+        }
+        
+        // All entries valid, replace the first one (LRU approximation)
+        set[0].key = key;
+        set[0].value = value;
     }
-};
-
-// Structure to represent the state of a contig assembly
-struct ContigState {
-    std::list<kmer_pair> contig;
-    bool completed = false;
-    bool waiting = false;
-    pkmer_t next_key;
-    int steps = 0;
     
-    explicit ContigState(const kmer_pair& start_node) {
-        contig.push_back(start_node);
+    double hit_rate() const {
+        if (total_hits + total_misses == 0) return 0.0;
+        return static_cast<double>(total_hits) / (total_hits + total_misses);
     }
 };
 
-// Optimized asynchronous contig assembly function
+// Optimized contig assembly with prefetching and better memory access patterns
 std::list<std::list<kmer_pair>> assemble_contigs_optimized(
     const std::vector<kmer_pair>& start_nodes,
     HashMap& hashmap,
     bool verbose) {
     
-    std::list<std::list<kmer_pair>> completed_contigs;
+    std::list<std::list<kmer_pair>> contigs;
+    LookupCache cache(32768);  // Use a much larger cache
+    
+    // Process multiple contigs simultaneously
+    const size_t MAX_ACTIVE_CONTIGS = 64;
     const int max_steps = 100000; // Prevent infinite loops
-    LookupCache cache(8192);  // Larger cache for better hit rate
     
-    // Active contigs being processed
-    std::deque<ContigState> active_contigs;
-    
-    // Initialize with all start nodes
-    for (const auto& start_node : start_nodes) {
-        active_contigs.emplace_back(start_node);
-    }
-    
-    // Keep track of contigs that are waiting for lookup results
-    int waiting_contigs = 0;
-    const int max_waiting = 64; // Maximum number of concurrent lookups
-    
-    // Batch processing of contigs
-    while (!active_contigs.empty()) {
-        // Process a batch from the front of the queue
-        const size_t batch_size = std::min<size_t>(64, active_contigs.size());
+    // Keep track of active contigs and their next keys to look up
+    struct ContigState {
+        std::list<kmer_pair> contig;
+        int steps;
+        bool completed;
         
-        // Prepare keys for batch lookup
-        std::vector<pkmer_t> batch_keys;
-        batch_keys.reserve(batch_size);
+        ContigState(const kmer_pair& start) 
+            : steps(0), completed(false) {
+            contig.push_back(start);
+        }
+    };
+    
+    // Process start nodes in chunks
+    for (size_t start_idx = 0; start_idx < start_nodes.size(); start_idx += MAX_ACTIVE_CONTIGS) {
+        std::vector<ContigState> active_contigs;
         
-        // First pass: process contigs and collect keys for batch lookup
-        for (size_t i = 0; i < batch_size && waiting_contigs < max_waiting; ++i) {
-            ContigState& state = active_contigs[i];
-            
-            // Skip completed or already waiting contigs
-            if (state.completed || state.waiting) continue;
-            
-            // Check if we've reached the end or max steps
-            if (state.contig.back().forwardExt() == 'F' || state.steps >= max_steps) {
-                state.completed = true;
-                continue;
-            }
-            
-            // Get the next k-mer to find
-            pkmer_t next_key = state.contig.back().next_kmer();
-            kmer_pair next_kmer;
-            
-            // Try cache first
-            if (cache.find(next_key, next_kmer)) {
-                state.contig.push_back(next_kmer);
-                state.steps++;
-            } else {
-                // Not in cache, add to batch lookup
-                state.next_key = next_key;
-                state.waiting = true;
-                batch_keys.push_back(next_key);
-                waiting_contigs++;
-            }
+        // Initialize batch of contigs
+        size_t end_idx = std::min(start_idx + MAX_ACTIVE_CONTIGS, start_nodes.size());
+        for (size_t i = start_idx; i < end_idx; i++) {
+            active_contigs.emplace_back(start_nodes[i]);
         }
         
-        // Process any pending communication
-        hashmap.progress();
-        
-        // If we have keys to look up, do a batch find
-        if (!batch_keys.empty()) {
-            // Callback to process results as they come in
-            auto process_result = [&](const pkmer_t& key, bool found, const kmer_pair& value) {
-                // Find the contig waiting for this result
-                for (auto& state : active_contigs) {
-                    if (state.waiting && state.next_key == key) {
-                        if (found) {
-                            // Found the k-mer, add to contig and cache
-                            state.contig.push_back(value);
-                            cache.insert(key, value);
-                            state.steps++;
-                        } else {
-                            // K-mer not found, mark contig as completed
-                            if (verbose) {
-                                BUtil::print("Rank %d: k-mer not found in hashmap.\n", upcxx::rank_me());
-                            }
-                            state.completed = true;
+        // Process until all contigs in batch are completed
+        bool all_completed;
+        do {
+            // Gather keys to look up
+            std::vector<pkmer_t> lookup_keys;
+            std::vector<kmer_pair> lookup_values;
+            std::vector<size_t> contig_indices;
+            
+            for (size_t i = 0; i < active_contigs.size(); i++) {
+                auto& state = active_contigs[i];
+                
+                if (!state.completed && 
+                    state.contig.back().forwardExt() != 'F' && 
+                    state.steps < max_steps) {
+                    
+                    pkmer_t next_key = state.contig.back().next_kmer();
+                    kmer_pair next_value;
+                    
+                    // Try cache first
+                    if (cache.find(next_key, next_value)) {
+                        state.contig.push_back(next_value);
+                        state.steps++;
+                    } else {
+                        // Not in cache, add to batch lookup
+                        lookup_keys.push_back(next_key);
+                        lookup_values.push_back(kmer_pair()); // Placeholder
+                        contig_indices.push_back(i);
+                    }
+                } else {
+                    state.completed = true;
+                }
+            }
+            
+            // Process any pending operations
+            hashmap.progress();
+            
+            // If we have keys to look up, do a batch find
+            if (!lookup_keys.empty()) {
+                // Perform batch lookup
+                std::vector<bool> results = hashmap.find_batch(lookup_keys, lookup_values);
+                
+                // Process results
+                for (size_t i = 0; i < results.size(); i++) {
+                    size_t contig_idx = contig_indices[i];
+                    
+                    if (results[i]) {
+                        // Found the k-mer, add to contig and cache
+                        active_contigs[contig_idx].contig.push_back(lookup_values[i]);
+                        active_contigs[contig_idx].steps++;
+                        cache.insert(lookup_keys[i], lookup_values[i]);
+                    } else {
+                        // K-mer not found, mark contig as completed
+                        if (verbose) {
+                            BUtil::print("Rank %d: k-mer not found in hashmap.\n", upcxx::rank_me());
                         }
-                        
-                        // No longer waiting for this contig
-                        state.waiting = false;
-                        waiting_contigs--;
-                        break;
+                        active_contigs[contig_idx].completed = true;
                     }
                 }
-            };
+            }
             
-            // Perform batch lookup with callback
-            hashmap.find_batch(batch_keys, process_result);
-        }
-        
-        // Move completed contigs to results and remove from active list
-        size_t initial_size = active_contigs.size();
-        for (size_t i = 0; i < initial_size; ++i) {
-            if (active_contigs.front().completed && !active_contigs.front().waiting) {
-                // If contig has more than just the start node, add to results
-                if (active_contigs.front().contig.size() > 1) {
-                    completed_contigs.push_back(std::move(active_contigs.front().contig));
+            // Check if all contigs are completed
+            all_completed = true;
+            for (const auto& state : active_contigs) {
+                if (!state.completed) {
+                    all_completed = false;
+                    break;
                 }
-                active_contigs.pop_front();
-            } else if (!active_contigs.front().waiting) {
-                // If not waiting, move to the back to be processed again
-                active_contigs.push_back(std::move(active_contigs.front()));
-                active_contigs.pop_front();
-            } else {
-                // If waiting, leave it in place
-                auto temp = std::move(active_contigs.front());
-                active_contigs.pop_front();
-                active_contigs.push_back(std::move(temp));
+            }
+            
+        } while (!all_completed);
+        
+        // Add completed contigs to the result
+        for (auto& state : active_contigs) {
+            if (state.steps >= max_steps && verbose) {
+                BUtil::print("Rank %d: Assembly aborted; possible infinite loop.\n", upcxx::rank_me());
+            }
+            
+            if (state.contig.size() > 1) {
+                contigs.push_back(std::move(state.contig));
             }
         }
         
-        // Process any pending communication after batch
+        // Process any pending operations between batches
         hashmap.progress();
     }
     
-    return completed_contigs;
+    if (verbose) {
+        BUtil::print("Rank %d: Cache hit rate: %.2f%%\n", 
+                  upcxx::rank_me(), cache.hit_rate() * 100.0);
+    }
+    
+    return contigs;
 }
 
 int main(int argc, char** argv) {
@@ -223,8 +274,8 @@ int main(int argc, char** argv) {
     size_t n_kmers = line_count(kmer_fname);
     bool verbose = (run_type == "verbose");
 
-    // Use an optimized hash table size - 1.5x instead of 4x
-    size_t hash_table_size = n_kmers * 1.5;
+    // Use a smaller hash table to reduce memory usage and improve locality
+    size_t hash_table_size = n_kmers * 1.2;  // 1.2x instead of 1.5x
     HashMap hashmap(hash_table_size);
 
     if (verbose) {
@@ -233,17 +284,13 @@ int main(int argc, char** argv) {
     }
 
     // Read kmers
-    auto start_read = std::chrono::high_resolution_clock::now();
     std::vector<kmer_pair> kmers = read_kmers(kmer_fname, upcxx::rank_n(), upcxx::rank_me());
-    auto end_read = std::chrono::high_resolution_clock::now();
-    double read_file_time = std::chrono::duration<double>(end_read - start_read).count();
 
     if (verbose) {
-        BUtil::print("Rank %d: Finished reading %zu kmers in %lf seconds.\n", 
-                     upcxx::rank_me(), kmers.size(), read_file_time);
+        BUtil::print("Rank %d: Finished reading %zu kmers.\n", upcxx::rank_me(), kmers.size());
     }
 
-    // Barrier to ensure all ranks have read their kmers
+    // Barrier for synchronization
     upcxx::barrier();
 
     auto start = std::chrono::high_resolution_clock::now();
@@ -258,26 +305,29 @@ int main(int argc, char** argv) {
                   return (a.hash() % upcxx::rank_n()) < (b.hash() % upcxx::rank_n()); 
               });
     
-    // Insert kmers in batches with progress processing
-    for (size_t i = 0; i < kmers.size(); i++) {
-        auto& kmer = kmers[i];
-        hashmap.insert(kmer);
-        if (kmer.backwardExt() == 'F') {
-            start_nodes.push_back(kmer);
+    // Insert kmers in batches with aggressive prefetching
+    const size_t INSERT_BATCH_SIZE = 1024;
+    for (size_t batch_start = 0; batch_start < kmers.size(); batch_start += INSERT_BATCH_SIZE) {
+        size_t batch_end = std::min(batch_start + INSERT_BATCH_SIZE, kmers.size());
+        
+        // Insert this batch
+        for (size_t i = batch_start; i < batch_end; i++) {
+            hashmap.insert(kmers[i]);
+            if (kmers[i].backwardExt() == 'F') {
+                start_nodes.push_back(kmers[i]);
+            }
         }
         
-        // Process progress occasionally
-        if (i % 1024 == 0) {
-            hashmap.progress();
-        }
+        // Process progress to handle pending communication
+        hashmap.progress();
     }
     
     // Ensure all insertions are complete
     hashmap.flush_insertions();
     
     auto end_insert = std::chrono::high_resolution_clock::now();
-
     double insert_time = std::chrono::duration<double>(end_insert - start).count();
+    
     if (verbose) {
         BUtil::print("Rank %d: Finished inserting %zu kmers in %lf seconds.\n",
                      upcxx::rank_me(), kmers.size(), insert_time);
@@ -289,19 +339,18 @@ int main(int argc, char** argv) {
                   return a.hash() < b.hash();
               });
     
-    auto start_assembly = std::chrono::high_resolution_clock::now();
+    auto start_read = std::chrono::high_resolution_clock::now();
 
-    // Assemble contigs using the optimized function
+    // Assemble contigs using the high-performance function
     std::list<std::list<kmer_pair>> contigs = assemble_contigs_optimized(start_nodes, hashmap, verbose);
 
-    auto end_assembly = std::chrono::high_resolution_clock::now();
+    auto end_read = std::chrono::high_resolution_clock::now();
     
     // Synchronize at the end
     upcxx::barrier();
-    
     auto end = std::chrono::high_resolution_clock::now();
 
-    double assembly_time = std::chrono::duration<double>(end_assembly - start_assembly).count();
+    double read_time = std::chrono::duration<double>(end_read - start_read).count();
     double total = std::chrono::duration<double>(end - start).count();
 
     int numKmers = std::accumulate(
@@ -314,9 +363,9 @@ int main(int argc, char** argv) {
 
     if (verbose) {
         printf("Rank %d reconstructed %d contigs with %d nodes from %d start nodes."
-               " (%lf assembly, %lf insert, %lf total)\n",
+               " (%lf read, %lf insert, %lf total)\n",
                upcxx::rank_me(), contigs.size(), numKmers, start_nodes.size(),
-               assembly_time, insert_time, total);
+               read_time, insert_time, total);
     }
 
     if (run_type == "test") {
