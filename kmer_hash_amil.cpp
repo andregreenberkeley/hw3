@@ -1,332 +1,330 @@
-#pragma once
-#include "kmer_t.hpp"
+#include <chrono>
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <list>
+#include <numeric>
+#include <set>
 #include <upcxx/upcxx.hpp>
 #include <vector>
-#include <map>
+#include <fstream>
 #include <algorithm>
-#include <queue>
-#include <optional>
+#include <string>
+#include <unordered_set>
+#include <unordered_map>
 
-// Increased batch size for better amortization of communication costs
-const size_t BATCH_SIZE = 2048;
+#include "hash_map.hpp"
+#include "kmer_t.hpp"
+#include "read_kmers.hpp"
+#include "butil.hpp"
 
-struct HashMapPart {
-    // Use raw arrays for better performance
-    upcxx::global_ptr<kmer_pair> data;
-    upcxx::global_ptr<int> used;
-    size_t size;
-
-    // Need an explicit constructor since we can't use default constructor
-    HashMapPart() : data(nullptr), used(nullptr), size(0) {}
+// Enhanced cache structure for contig assembly
+struct LookupCache {
+    std::vector<std::pair<pkmer_t, kmer_pair>> entries;
+    size_t capacity;
+    size_t mask;
     
-    // Reorganize as rank-based buffers for better communication overlap
-    std::vector<std::vector<kmer_pair>> insertion_buffers;
-};
-
-// Pending find operation tracking
-struct PendingFind {
-    pkmer_t key;
-    upcxx::future<std::pair<bool, kmer_pair>> future;
-    
-    PendingFind(const pkmer_t& k, upcxx::future<std::pair<bool, kmer_pair>> f)
-        : key(k), future(std::move(f)) {}
-};
-
-struct HashMap {
-    upcxx::dist_object<HashMapPart> distributed_map;
-    size_t my_size;
-    size_t global_size;
-    upcxx::atomic_domain<int> ad_int;
-    
-    // Track pending operations
-    std::vector<upcxx::future<>> pending_insertions;
-    std::vector<PendingFind> pending_finds;
-    
-    HashMap(size_t size) 
-        : distributed_map(HashMapPart()),
-          ad_int({upcxx::atomic_op::compare_exchange, upcxx::atomic_op::load}) {
-        
-        // Initialize my part of the hash table
-        my_size = (size + upcxx::rank_n() - 1) / upcxx::rank_n(); // Ceiling division
-        
-        auto local_data = upcxx::new_array<kmer_pair>(my_size);
-        auto local_used = upcxx::new_array<int>(my_size);
-        
-        // Initialize usage flags
-        for (size_t i = 0; i < my_size; i++) {
-            local_used.local()[i] = 0;
-        }
-        
-        // Set up the distributed map
-        distributed_map->data = local_data;
-        distributed_map->used = local_used;
-        distributed_map->size = my_size;
-        
-        // Initialize buffers for each rank
-        distributed_map->insertion_buffers.resize(upcxx::rank_n());
-        for (auto& buffer : distributed_map->insertion_buffers) {
-            buffer.reserve(BATCH_SIZE);
-        }
-        
-        // Calculate total size
-        global_size = upcxx::reduce_all(my_size, upcxx::op_fast_add).wait();
-        
-        // Reserve space for pending operations
-        pending_insertions.reserve(upcxx::rank_n());
-        pending_finds.reserve(100);
+    LookupCache(size_t size) {
+        // Find next power of 2
+        capacity = 1;
+        while (capacity < size) capacity <<= 1;
+        mask = capacity - 1;
+        entries.resize(capacity);
+        clear();
     }
     
-    ~HashMap() {
-        // Wait for all pending operations to complete
-        wait_all();
-        
-        // Clean up allocated memory
-        if (distributed_map->data) upcxx::delete_array(distributed_map->data);
-        if (distributed_map->used) upcxx::delete_array(distributed_map->used);
+    void clear() {
+        for (auto& entry : entries) {
+            entry.second = kmer_pair();
+        }
     }
     
-    // Non-blocking insert with pending operations tracking
-    bool insert_async(const kmer_pair& kmer) {
-        uint64_t hash = kmer.hash();
-        int target_rank = hash % upcxx::rank_n();
-        
-        if (target_rank == upcxx::rank_me()) {
-            // Local insertion
-            return insert_local(kmer);
-        } else {
-            // Add to appropriate buffer
-            auto& buffer = distributed_map->insertion_buffers[target_rank];
-            buffer.push_back(kmer);
-            
-            // Flush if buffer is full
-            if (buffer.size() >= BATCH_SIZE) {
-                auto future = flush_buffer_for_rank(target_rank);
-                pending_insertions.push_back(std::move(future));
-            }
-            
+    bool find(const pkmer_t& key, kmer_pair& value) {
+        size_t idx = key.hash() & mask;
+        if (entries[idx].first == key && entries[idx].second.kmer == key) {
+            value = entries[idx].second;
             return true;
         }
+        return false;
     }
     
-    // Local insertion helper
-    bool insert_local(const kmer_pair& kmer) {
-        uint64_t hash = kmer.hash();
-        uint64_t start_slot = (hash / upcxx::rank_n()) % my_size;
+    void insert(const pkmer_t& key, const kmer_pair& value) {
+        size_t idx = key.hash() & mask;
+        entries[idx] = {key, value};
+    }
+};
+
+// Optimized contig assembly function with overlapped communication
+std::list<std::list<kmer_pair>> assemble_contigs_overlapped(
+    const std::vector<kmer_pair>& start_nodes,
+    HashMap& hashmap,
+    bool verbose) {
+    
+    std::list<std::list<kmer_pair>> contigs;
+    const int max_steps = 100000; // Prevent infinite loops
+    LookupCache cache(8192);  // Increased cache size
+    
+    // Process contigs in batches
+    size_t batch_size = 64;  // Increased batch size
+    for (size_t i = 0; i < start_nodes.size(); i += batch_size) {
+        size_t end = std::min(i + batch_size, start_nodes.size());
+        std::vector<std::list<kmer_pair>> batch_contigs(end - i);
         
-        // Linear probing
-        for (uint64_t probe = 0; probe < my_size; probe++) {
-            uint64_t slot = (start_slot + probe) % my_size;
-            
-            // Try to claim the slot atomically
-            int prev = ad_int.compare_exchange(
-                distributed_map->used + slot, 0, 1, 
-                std::memory_order_relaxed
-            ).wait();
-            
-            if (prev == 0) {
-                // Slot was empty, write the k-mer
-                distributed_map->data.local()[slot] = kmer;
-                return true;
-            }
+        // Track find operations for each contig
+        std::vector<std::vector<int>> pending_find_ids(end - i);
+        std::vector<bool> contig_done(end - i, false);
+        
+        // Clear cache between batches
+        cache.clear();
+        
+        // Initialize each contig with its start node
+        for (size_t j = i; j < end; j++) {
+            batch_contigs[j - i].push_back(start_nodes[j]);
         }
-        return false; // Table is full
-    }
-    
-    // Asynchronous flush for a specific rank
-    upcxx::future<> flush_buffer_for_rank(int rank) {
-        auto& buffer = distributed_map->insertion_buffers[rank];
-        if (buffer.empty()) return upcxx::make_future();
         
-        // Create a copy of the buffer to send
-        std::vector<kmer_pair> batch_to_send = std::move(buffer);
-        buffer = std::vector<kmer_pair>(); // Reset buffer
-        buffer.reserve(BATCH_SIZE);
+        // Track how many contigs are still active
+        int active_contigs = end - i;
         
-        // Send asynchronously and return future
-        return upcxx::rpc(rank,
-            [](upcxx::dist_object<HashMapPart>& dmap, std::vector<kmer_pair> batch) {
-                for (const auto& kmer : batch) {
-                    uint64_t hash = kmer.hash();
-                    uint64_t start_slot = (hash / upcxx::rank_n()) % dmap->size;
+        // Continue until all contigs in the batch are done
+        while (active_contigs > 0) {
+            // Issue find operations for all active contigs
+            for (size_t j = i; j < end; j++) {
+                size_t contig_idx = j - i;
+                
+                // Skip if this contig is already done
+                if (contig_done[contig_idx]) continue;
+                
+                auto& contig = batch_contigs[contig_idx];
+                
+                // If no pending operations, issue a new one
+                if (pending_find_ids[contig_idx].empty()) {
+                    // Get the next k-mer to find
+                    pkmer_t next_key = contig.back().next_kmer();
                     
-                    // Linear probing
-                    for (uint64_t probe = 0; probe < dmap->size; probe++) {
-                        uint64_t slot = (start_slot + probe) % dmap->size;
-                        if (dmap->used.local()[slot] == 0) {
-                            // Found empty slot
-                            dmap->used.local()[slot] = 1;
-                            dmap->data.local()[slot] = kmer;
-                            break;
+                    // Check in cache first
+                    kmer_pair next_kmer;
+                    if (cache.find(next_key, next_kmer)) {
+                        // Found in cache, add to contig immediately
+                        contig.push_back(next_kmer);
+                        
+                        // Check if we're at the end of this contig
+                        if (contig.back().forwardExt() == 'F' || 
+                            contig.size() >= max_steps) {
+                            contig_done[contig_idx] = true;
+                            active_contigs--;
                         }
+                    } else {
+                        // Not in cache, issue async find
+                        int find_id = hashmap.queue_find(next_key);
+                        pending_find_ids[contig_idx].push_back(find_id);
                     }
                 }
-            },
-            distributed_map, std::move(batch_to_send)
-        );
-    }
-    
-    // Process completed insertion operations
-    void process_pending_insertions() {
-        // Move completed futures out
-        std::vector<upcxx::future<>> still_pending;
-        still_pending.reserve(pending_insertions.size());
-        
-        for (auto& future : pending_insertions) {
-            if (future.ready()) {
-                // This future is complete, nothing more to do
-            } else {
-                still_pending.push_back(std::move(future));
             }
-        }
-        
-        pending_insertions = std::move(still_pending);
-        
-        // Process progress to move communications forward
-        upcxx::progress();
-    }
-    
-    // Non-blocking find with future
-    upcxx::future<std::pair<bool, kmer_pair>> find_async(const pkmer_t& key_kmer) {
-        uint64_t hash = key_kmer.hash();
-        int target_rank = hash % upcxx::rank_n();
-        
-        if (target_rank == upcxx::rank_me()) {
-            // Local lookup - immediate result
-            kmer_pair result;
-            bool found = find_local(key_kmer, result);
-            return upcxx::make_future(std::make_pair(found, result));
-        } else {
-            // Remote lookup using RPC
-            return upcxx::rpc(target_rank,
-                [](upcxx::dist_object<HashMapPart>& dmap, pkmer_t key) -> std::pair<bool, kmer_pair> {
-                    uint64_t hash = key.hash();
-                    uint64_t start_slot = (hash / upcxx::rank_n()) % dmap->size;
+            
+            // Process pending operations
+            hashmap.process_pending_finds();
+            hashmap.process_pending_insertions();
+            
+            // Check for completed find operations
+            for (size_t j = i; j < end; j++) {
+                size_t contig_idx = j - i;
+                
+                // Skip if this contig is already done
+                if (contig_done[contig_idx]) continue;
+                
+                auto& contig = batch_contigs[contig_idx];
+                auto& find_ids = pending_find_ids[contig_idx];
+                
+                // Check all pending finds for this contig
+                for (auto it = find_ids.begin(); it != find_ids.end(); ) {
+                    int find_id = *it;
                     
-                    for (uint64_t probe = 0; probe < dmap->size; probe++) {
-                        uint64_t slot = (start_slot + probe) % dmap->size;
-                        
-                        if (dmap->used.local()[slot] == 0) {
-                            return {false, kmer_pair()}; // Not found
+                    if (hashmap.is_find_ready(find_id)) {
+                        // Get the result
+                        auto result_opt = hashmap.get_find_result(find_id);
+                        if (result_opt.has_value()) {
+                            auto [found, next_kmer] = result_opt.value();
+                            
+                            if (found) {
+                                // Add to cache and contig
+                                cache.insert(next_kmer.kmer, next_kmer);
+                                contig.push_back(next_kmer);
+                                
+                                // Check if we're at the end of this contig
+                                if (contig.back().forwardExt() == 'F' || 
+                                    contig.size() >= max_steps) {
+                                    contig_done[contig_idx] = true;
+                                    active_contigs--;
+                                }
+                            } else {
+                                // K-mer not found, contig ends here
+                                if (verbose) {
+                                    BUtil::print("Rank %d: k-mer not found in hashmap.\n", upcxx::rank_me());
+                                }
+                                contig_done[contig_idx] = true;
+                                active_contigs--;
+                            }
                         }
                         
-                        const kmer_pair& current = dmap->data.local()[slot];
-                        if (current.kmer == key) {
-                            return {true, current};
-                        }
+                        // Remove this find_id from the list
+                        it = find_ids.erase(it);
+                    } else {
+                        ++it;
                     }
-                    return {false, kmer_pair()}; // Not found
-                },
-                distributed_map, key_kmer
-            );
-        }
-    }
-    
-    // Local find helper
-    bool find_local(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
-        uint64_t hash = key_kmer.hash();
-        uint64_t start_slot = (hash / upcxx::rank_n()) % my_size;
-        
-        for (uint64_t probe = 0; probe < my_size; probe++) {
-            uint64_t slot = (start_slot + probe) % my_size;
-            
-            // Check if slot is used
-            if (distributed_map->used.local()[slot] == 0) {
-                return false; // Empty slot, k-mer not found
+                }
             }
             
-            // Check if this is our k-mer
-            const kmer_pair& current = distributed_map->data.local()[slot];
-            if (current.kmer == key_kmer) {
-                val_kmer = current;
-                return true;
-            }
+            // Yield to make progress on communications
+            upcxx::progress();
         }
-        return false; // Not found
-    }
-    
-    // Queue a find operation and return an ID to track it
-    int queue_find(const pkmer_t& key_kmer) {
-        auto future = find_async(key_kmer);
-        int id = pending_finds.size();
-        pending_finds.emplace_back(key_kmer, std::move(future));
-        return id;
-    }
-    
-    // Check if a specific find is complete
-    bool is_find_ready(int id) {
-        if (id >= 0 && id < pending_finds.size()) {
-            return pending_finds[id].future.ready();
-        }
-        return false;
-    }
-    
-    // Get result of a pending find
-    std::optional<std::pair<bool, kmer_pair>> get_find_result(int id) {
-        if (id >= 0 && id < pending_finds.size() && pending_finds[id].future.ready()) {
-            return pending_finds[id].future.wait();
-        }
-        return std::nullopt;
-    }
-    
-    // Process pending finds that are ready
-    void process_pending_finds() {
-        // Process progress to move communications forward
-        upcxx::progress();
-    }
-    
-    // Flush all insertion buffers asynchronously
-    void flush_insertions_async() {
-        for (int rank = 0; rank < upcxx::rank_n(); rank++) {
-            if (!distributed_map->insertion_buffers[rank].empty()) {
-                auto future = flush_buffer_for_rank(rank);
-                pending_insertions.push_back(std::move(future));
+        
+        // Add batch results to contigs
+        for (auto& contig : batch_contigs) {
+            if (!contig.empty()) {
+                contigs.push_back(std::move(contig));
             }
         }
     }
     
-    // Wait for all pending operations to complete
-    void wait_all() {
-        // Flush any remaining buffers
-        flush_insertions_async();
+    return contigs;
+}
+
+int main(int argc, char** argv) {
+    upcxx::init();
+
+    if (argc < 2) {
+        BUtil::print("usage: srun -N nodes -n ranks ./kmer_hash kmer_file [verbose|test [prefix]]\n");
+        upcxx::finalize();
+        exit(1);
+    }
+
+    std::string kmer_fname = std::string(argv[1]);
+    std::string run_type = "";
+    if (argc >= 3) {
+        run_type = std::string(argv[2]);
+    }
+
+    std::string test_prefix = "test";
+    if (run_type == "test" && argc >= 4) {
+        test_prefix = std::string(argv[3]);
+    }
+
+    int ks = kmer_size(kmer_fname);
+
+    if (ks != KMER_LEN) {
+        throw std::runtime_error("Error: " + kmer_fname + " contains " + std::to_string(ks) +
+                                 "-mers, while this binary is compiled for " +
+                                 std::to_string(KMER_LEN) +
+                                 "-mers.  Modify packing.hpp and recompile.");
+    }
+
+    size_t n_kmers = line_count(kmer_fname);
+    bool verbose = (run_type == "verbose");
+
+    // Use an optimized hash table size - 1.5x instead of 4x
+    size_t hash_table_size = n_kmers * 1.5;
+    HashMap hashmap(hash_table_size);
+
+    if (verbose) {
+        BUtil::print("Rank %d: Initializing hash table of size %d for %d kmers.\n",
+                     upcxx::rank_me(), hash_table_size, n_kmers);
+    }
+
+    // Read kmers
+    std::vector<kmer_pair> kmers = read_kmers(kmer_fname, upcxx::rank_n(), upcxx::rank_me());
+
+    if (verbose) {
+        BUtil::print("Rank %d: Finished reading %zu kmers.\n", upcxx::rank_me(), kmers.size());
+    }
+
+    // Lightweight barrier to ensure all ranks have their kmers
+    upcxx::barrier();
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    // Collect start nodes and track kmer insertions
+    std::vector<kmer_pair> start_nodes;
+    start_nodes.reserve(kmers.size() / 10);
+    
+    // Sort kmers by rank to improve locality and reduce communication
+    std::sort(kmers.begin(), kmers.end(), 
+              [](const kmer_pair& a, const kmer_pair& b) { 
+                  return (a.hash() % upcxx::rank_n()) < (b.hash() % upcxx::rank_n()); 
+              });
+    
+    // Bulk insert with overlapped communication
+    const size_t progress_interval = 1000; // How often to process pending operations
+    for (size_t i = 0; i < kmers.size(); i++) {
+        auto& kmer = kmers[i];
         
-        // Wait for all pending insertions
-        for (auto& future : pending_insertions) {
-            future.wait();
-        }
-        pending_insertions.clear();
+        // Insert asynchronously
+        hashmap.insert_async(kmer);
         
-        // Wait for all pending finds
-        for (auto& find : pending_finds) {
-            find.future.wait();
+        // Collect start nodes
+        if (kmer.backwardExt() == 'F') {
+            start_nodes.push_back(kmer);
         }
-        pending_finds.clear();
         
-        // Global synchronization
-        upcxx::barrier();
-    }
-    
-    // Original API compatibility functions
-    bool insert(const kmer_pair& kmer) {
-        return insert_async(kmer);
-    }
-    
-    bool find(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
-        auto result = find_async(key_kmer).wait();
-        if (result.first) {
-            val_kmer = result.second;
-            return true;
+        // Periodically process pending operations
+        if (i % progress_interval == 0) {
+            hashmap.process_pending_insertions();
         }
-        return false;
     }
     
-    void flush_insertions() {
-        flush_insertions_async();
-        for (auto& future : pending_insertions) {
-            future.wait();
+    // Ensure all insertions are complete before assembly
+    hashmap.flush_insertions();
+    
+    auto end_insert = std::chrono::high_resolution_clock::now();
+
+    double insert_time = std::chrono::duration<double>(end_insert - start).count();
+    if (verbose) {
+        BUtil::print("Rank %d: Finished inserting %zu kmers in %lf seconds.\n",
+                     upcxx::rank_me(), kmers.size(), insert_time);
+    }
+
+    // Sort start nodes to improve locality during assembly
+    std::sort(start_nodes.begin(), start_nodes.end(),
+              [](const kmer_pair& a, const kmer_pair& b) {
+                  return a.hash() < b.hash();
+              });
+    
+    auto start_read = std::chrono::high_resolution_clock::now();
+
+    // Assemble contigs using the optimized overlapped function
+    std::list<std::list<kmer_pair>> contigs = assemble_contigs_overlapped(start_nodes, hashmap, verbose);
+
+    auto end_read = std::chrono::high_resolution_clock::now();
+    
+    // Synchronize at the end
+    upcxx::barrier();
+    auto end = std::chrono::high_resolution_clock::now();
+
+    double read_time = std::chrono::duration<double>(end_read - start_read).count();
+    double total = std::chrono::duration<double>(end - start).count();
+
+    int numKmers = std::accumulate(
+        contigs.begin(), contigs.end(), 0,
+        [](int sum, const std::list<kmer_pair>& contig) { return sum + contig.size(); });
+
+    if (run_type != "test") {
+        BUtil::print("Rank %d: Assembled in %lf total\n", upcxx::rank_me(), total);
+    }
+
+    if (verbose) {
+        printf("Rank %d reconstructed %d contigs with %d nodes from %d start nodes."
+               " (%lf read, %lf insert, %lf total)\n",
+               upcxx::rank_me(), contigs.size(), numKmers, start_nodes.size(),
+               read_time, insert_time, total);
+    }
+
+    if (run_type == "test") {
+        std::ofstream fout(test_prefix + "_" + std::to_string(upcxx::rank_me()) + ".dat");
+        for (const auto& contig : contigs) {
+            fout << extract_contig(contig) << std::endl;
         }
-        pending_insertions.clear();
-        upcxx::barrier();
+        fout.close();
     }
-    
-    size_t size() const noexcept { return global_size; }
-};
+
+    upcxx::finalize();
+    return 0;
+}
