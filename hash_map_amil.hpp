@@ -4,10 +4,11 @@
 #include <vector>
 #include <map>
 #include <algorithm>
-#include <cassert>
+#include <queue>
+#include <optional>
 
-// Significantly increase batch size for better network utilization
-const size_t BATCH_SIZE = 4096;
+// Increased batch size for better amortization of communication costs
+const size_t BATCH_SIZE = 2048;
 
 struct HashMapPart {
     // Use raw arrays for better performance
@@ -18,8 +19,17 @@ struct HashMapPart {
     // Need an explicit constructor since we can't use default constructor
     HashMapPart() : data(nullptr), used(nullptr), size(0) {}
     
-    // Buffer for batched operations
-    std::vector<std::pair<int, kmer_pair>> insertion_buffer;
+    // Reorganize as rank-based buffers for better communication overlap
+    std::vector<std::vector<kmer_pair>> insertion_buffers;
+};
+
+// Pending find operation tracking
+struct PendingFind {
+    pkmer_t key;
+    upcxx::future<std::pair<bool, kmer_pair>> future;
+    
+    PendingFind(const pkmer_t& k, upcxx::future<std::pair<bool, kmer_pair>> f)
+        : key(k), future(std::move(f)) {}
 };
 
 struct HashMap {
@@ -28,59 +38,191 @@ struct HashMap {
     size_t global_size;
     upcxx::atomic_domain<int> ad_int;
     
-    // Use direct local pointers for faster access to local data
-    kmer_pair* local_data;
-    int* local_used;
+    // Track pending operations
+    std::vector<upcxx::future<>> pending_insertions;
+    std::vector<PendingFind> pending_finds;
     
     HashMap(size_t size) 
         : distributed_map(HashMapPart()),
-          ad_int({upcxx::atomic_op::compare_exchange, upcxx::atomic_op::load}),
-          local_data(nullptr),
-          local_used(nullptr) {
+          ad_int({upcxx::atomic_op::compare_exchange, upcxx::atomic_op::load}) {
         
         // Initialize my part of the hash table
         my_size = (size + upcxx::rank_n() - 1) / upcxx::rank_n(); // Ceiling division
         
-        auto local_data_ptr = upcxx::new_array<kmer_pair>(my_size);
-        auto local_used_ptr = upcxx::new_array<int>(my_size);
-        
-        // Save local pointers for direct access
-        local_data = local_data_ptr.local();
-        local_used = local_used_ptr.local();
+        auto local_data = upcxx::new_array<kmer_pair>(my_size);
+        auto local_used = upcxx::new_array<int>(my_size);
         
         // Initialize usage flags
         for (size_t i = 0; i < my_size; i++) {
-            local_used[i] = 0;
+            local_used.local()[i] = 0;
         }
         
         // Set up the distributed map
-        distributed_map->data = local_data_ptr;
-        distributed_map->used = local_used_ptr;
+        distributed_map->data = local_data;
+        distributed_map->used = local_used;
         distributed_map->size = my_size;
-        distributed_map->insertion_buffer.reserve(BATCH_SIZE);
+        
+        // Initialize buffers for each rank
+        distributed_map->insertion_buffers.resize(upcxx::rank_n());
+        for (auto& buffer : distributed_map->insertion_buffers) {
+            buffer.reserve(BATCH_SIZE);
+        }
         
         // Calculate total size
         global_size = upcxx::reduce_all(my_size, upcxx::op_fast_add).wait();
+        
+        // Reserve space for pending operations
+        pending_insertions.reserve(upcxx::rank_n());
+        pending_finds.reserve(100);
     }
     
     ~HashMap() {
+        // Wait for all pending operations to complete
+        wait_all();
+        
         // Clean up allocated memory
         if (distributed_map->data) upcxx::delete_array(distributed_map->data);
         if (distributed_map->used) upcxx::delete_array(distributed_map->used);
     }
     
-    // Process any pending communication
-    void progress() {
+    // Non-blocking insert with pending operations tracking
+    bool insert_async(const kmer_pair& kmer) {
+        uint64_t hash = kmer.hash();
+        int target_rank = hash % upcxx::rank_n();
+        
+        if (target_rank == upcxx::rank_me()) {
+            // Local insertion
+            return insert_local(kmer);
+        } else {
+            // Add to appropriate buffer
+            auto& buffer = distributed_map->insertion_buffers[target_rank];
+            buffer.push_back(kmer);
+            
+            // Flush if buffer is full
+            if (buffer.size() >= BATCH_SIZE) {
+                auto future = flush_buffer_for_rank(target_rank);
+                pending_insertions.push_back(std::move(future));
+            }
+            
+            return true;
+        }
+    }
+    
+    // Local insertion helper
+    bool insert_local(const kmer_pair& kmer) {
+        uint64_t hash = kmer.hash();
+        uint64_t start_slot = (hash / upcxx::rank_n()) % my_size;
+        
+        // Linear probing
+        for (uint64_t probe = 0; probe < my_size; probe++) {
+            uint64_t slot = (start_slot + probe) % my_size;
+            
+            // Try to claim the slot atomically
+            int prev = ad_int.compare_exchange(
+                distributed_map->used + slot, 0, 1, 
+                std::memory_order_relaxed
+            ).wait();
+            
+            if (prev == 0) {
+                // Slot was empty, write the k-mer
+                distributed_map->data.local()[slot] = kmer;
+                return true;
+            }
+        }
+        return false; // Table is full
+    }
+    
+    // Asynchronous flush for a specific rank
+    upcxx::future<> flush_buffer_for_rank(int rank) {
+        auto& buffer = distributed_map->insertion_buffers[rank];
+        if (buffer.empty()) return upcxx::make_future();
+        
+        // Create a copy of the buffer to send
+        std::vector<kmer_pair> batch_to_send = std::move(buffer);
+        buffer = std::vector<kmer_pair>(); // Reset buffer
+        buffer.reserve(BATCH_SIZE);
+        
+        // Send asynchronously and return future
+        return upcxx::rpc(rank,
+            [](upcxx::dist_object<HashMapPart>& dmap, std::vector<kmer_pair> batch) {
+                for (const auto& kmer : batch) {
+                    uint64_t hash = kmer.hash();
+                    uint64_t start_slot = (hash / upcxx::rank_n()) % dmap->size;
+                    
+                    // Linear probing
+                    for (uint64_t probe = 0; probe < dmap->size; probe++) {
+                        uint64_t slot = (start_slot + probe) % dmap->size;
+                        if (dmap->used.local()[slot] == 0) {
+                            // Found empty slot
+                            dmap->used.local()[slot] = 1;
+                            dmap->data.local()[slot] = kmer;
+                            break;
+                        }
+                    }
+                }
+            },
+            distributed_map, std::move(batch_to_send)
+        );
+    }
+    
+    // Process completed insertion operations
+    void process_pending_insertions() {
+        // Move completed futures out
+        std::vector<upcxx::future<>> still_pending;
+        still_pending.reserve(pending_insertions.size());
+        
+        for (auto& future : pending_insertions) {
+            if (future.ready()) {
+                // This future is complete, nothing more to do
+            } else {
+                still_pending.push_back(std::move(future));
+            }
+        }
+        
+        pending_insertions = std::move(still_pending);
+        
+        // Process progress to move communications forward
         upcxx::progress();
     }
     
-    // Fast check if a slot is empty (without atomics)
-    bool is_slot_empty(uint64_t slot) const {
-        return local_used[slot] == 0;
+    // Non-blocking find with future
+    upcxx::future<std::pair<bool, kmer_pair>> find_async(const pkmer_t& key_kmer) {
+        uint64_t hash = key_kmer.hash();
+        int target_rank = hash % upcxx::rank_n();
+        
+        if (target_rank == upcxx::rank_me()) {
+            // Local lookup - immediate result
+            kmer_pair result;
+            bool found = find_local(key_kmer, result);
+            return upcxx::make_future(std::make_pair(found, result));
+        } else {
+            // Remote lookup using RPC
+            return upcxx::rpc(target_rank,
+                [](upcxx::dist_object<HashMapPart>& dmap, pkmer_t key) -> std::pair<bool, kmer_pair> {
+                    uint64_t hash = key.hash();
+                    uint64_t start_slot = (hash / upcxx::rank_n()) % dmap->size;
+                    
+                    for (uint64_t probe = 0; probe < dmap->size; probe++) {
+                        uint64_t slot = (start_slot + probe) % dmap->size;
+                        
+                        if (dmap->used.local()[slot] == 0) {
+                            return {false, kmer_pair()}; // Not found
+                        }
+                        
+                        const kmer_pair& current = dmap->data.local()[slot];
+                        if (current.kmer == key) {
+                            return {true, current};
+                        }
+                    }
+                    return {false, kmer_pair()}; // Not found
+                },
+                distributed_map, key_kmer
+            );
+        }
     }
     
-    // Fast local find without RPC
-    bool find_local(const pkmer_t& key_kmer, kmer_pair& val_kmer) const {
+    // Local find helper
+    bool find_local(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
         uint64_t hash = key_kmer.hash();
         uint64_t start_slot = (hash / upcxx::rank_n()) % my_size;
         
@@ -88,12 +230,12 @@ struct HashMap {
             uint64_t slot = (start_slot + probe) % my_size;
             
             // Check if slot is used
-            if (is_slot_empty(slot)) {
+            if (distributed_map->used.local()[slot] == 0) {
                 return false; // Empty slot, k-mer not found
             }
             
-            // Check if this is our k-mer (direct access to avoid indirection)
-            const kmer_pair& current = local_data[slot];
+            // Check if this is our k-mer
+            const kmer_pair& current = distributed_map->data.local()[slot];
             if (current.kmer == key_kmer) {
                 val_kmer = current;
                 return true;
@@ -102,247 +244,87 @@ struct HashMap {
         return false; // Not found
     }
     
+    // Queue a find operation and return an ID to track it
+    int queue_find(const pkmer_t& key_kmer) {
+        auto future = find_async(key_kmer);
+        int id = pending_finds.size();
+        pending_finds.emplace_back(key_kmer, std::move(future));
+        return id;
+    }
+    
+    // Check if a specific find is complete
+    bool is_find_ready(int id) {
+        if (id >= 0 && id < pending_finds.size()) {
+            return pending_finds[id].future.ready();
+        }
+        return false;
+    }
+    
+    // Get result of a pending find
+    std::optional<std::pair<bool, kmer_pair>> get_find_result(int id) {
+        if (id >= 0 && id < pending_finds.size() && pending_finds[id].future.ready()) {
+            return pending_finds[id].future.wait();
+        }
+        return std::nullopt;
+    }
+    
+    // Process pending finds that are ready
+    void process_pending_finds() {
+        // Process progress to move communications forward
+        upcxx::progress();
+    }
+    
+    // Flush all insertion buffers asynchronously
+    void flush_insertions_async() {
+        for (int rank = 0; rank < upcxx::rank_n(); rank++) {
+            if (!distributed_map->insertion_buffers[rank].empty()) {
+                auto future = flush_buffer_for_rank(rank);
+                pending_insertions.push_back(std::move(future));
+            }
+        }
+    }
+    
+    // Wait for all pending operations to complete
+    void wait_all() {
+        // Flush any remaining buffers
+        flush_insertions_async();
+        
+        // Wait for all pending insertions
+        for (auto& future : pending_insertions) {
+            future.wait();
+        }
+        pending_insertions.clear();
+        
+        // Wait for all pending finds
+        for (auto& find : pending_finds) {
+            find.future.wait();
+        }
+        pending_finds.clear();
+        
+        // Global synchronization
+        upcxx::barrier();
+    }
+    
+    // Original API compatibility functions
     bool insert(const kmer_pair& kmer) {
-        uint64_t hash = kmer.hash();
-        int target_rank = hash % upcxx::rank_n();
-        
-        if (target_rank == upcxx::rank_me()) {
-            // Local insertion - use direct pointers for better performance
-            uint64_t start_slot = (hash / upcxx::rank_n()) % my_size;
-            
-            // Linear probing
-            for (uint64_t probe = 0; probe < my_size; probe++) {
-                uint64_t slot = (start_slot + probe) % my_size;
-                
-                // Check if slot appears empty (quick check without atomic)
-                if (is_slot_empty(slot)) {
-                    // Try to claim the slot atomically
-                    int prev = ad_int.compare_exchange(
-                        distributed_map->used + slot, 0, 1, 
-                        std::memory_order_relaxed
-                    ).wait();
-                    
-                    if (prev == 0) {
-                        // Slot was empty, write the k-mer directly
-                        local_data[slot] = kmer;
-                        return true;
-                    }
-                }
-            }
-            return false; // Table is full
-        } else {
-            // Buffer for remote insertion
-            distributed_map->insertion_buffer.push_back({target_rank, kmer});
-            
-            // Flush when buffer is full
-            if (distributed_map->insertion_buffer.size() >= BATCH_SIZE) {
-                flush_insertion_buffer();
-            }
-            return true;
-        }
-    }
-    
-    void flush_insertion_buffer() {
-        auto& buffer = distributed_map->insertion_buffer;
-        if (buffer.empty()) return;
-        
-        // Sort by target rank to optimize communication
-        std::sort(buffer.begin(), buffer.end(),
-                 [](const auto& a, const auto& b) { return a.first < b.first; });
-        
-        // Group insertions by rank
-        int current_rank = -1;
-        std::vector<kmer_pair> current_batch;
-        current_batch.reserve(BATCH_SIZE);
-        
-        for (const auto& [rank, kmer] : buffer) {
-            if (rank != current_rank) {
-                // Send previous batch if exists
-                if (!current_batch.empty()) {
-                    send_batch_to_rank(current_rank, current_batch);
-                    current_batch.clear();
-                }
-                current_rank = rank;
-            }
-            current_batch.push_back(kmer);
-        }
-        
-        // Send the last batch
-        if (!current_batch.empty()) {
-            send_batch_to_rank(current_rank, current_batch);
-        }
-        
-        buffer.clear();
-    }
-    
-    void send_batch_to_rank(int rank, const std::vector<kmer_pair>& kmers) {
-        // Use fire-and-forget RPC for speed
-        upcxx::rpc_ff(rank,
-            [](upcxx::dist_object<HashMapPart>& dmap, std::vector<kmer_pair> batch) {
-                // Get direct pointers to local data for better performance
-                kmer_pair* local_data = dmap->data.local();
-                int* local_used = dmap->used.local();
-                size_t size = dmap->size;
-                
-                for (const auto& kmer : batch) {
-                    uint64_t hash = kmer.hash();
-                    uint64_t start_slot = (hash / upcxx::rank_n()) % size;
-                    
-                    // Try to find an empty slot
-                    for (uint64_t probe = 0; probe < size; probe++) {
-                        uint64_t slot = (start_slot + probe) % size;
-                        if (local_used[slot] == 0) {
-                            // Found empty slot, use memory fence for correctness
-                            __sync_synchronize(); // Memory barrier
-                            local_used[slot] = 1;
-                            local_data[slot] = kmer;
-                            break;
-                        }
-                    }
-                }
-            },
-            distributed_map, kmers
-        );
+        return insert_async(kmer);
     }
     
     bool find(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
-        uint64_t hash = key_kmer.hash();
-        int target_rank = hash % upcxx::rank_n();
-        
-        // Process any pending communication
-        progress();
-        
-        if (target_rank == upcxx::rank_me()) {
-            // Local lookup - use the optimized version
-            return find_local(key_kmer, val_kmer);
-        } else {
-            // Remote lookup using RPC
-            auto result = upcxx::rpc(target_rank,
-                [](upcxx::dist_object<HashMapPart>& dmap, pkmer_t key) -> std::pair<bool, kmer_pair> {
-                    // Get direct local pointers
-                    kmer_pair* local_data = dmap->data.local();
-                    int* local_used = dmap->used.local();
-                    size_t size = dmap->size;
-                    
-                    uint64_t hash = key.hash();
-                    uint64_t start_slot = (hash / upcxx::rank_n()) % size;
-                    
-                    for (uint64_t probe = 0; probe < size; probe++) {
-                        uint64_t slot = (start_slot + probe) % size;
-                        
-                        if (local_used[slot] == 0) {
-                            return {false, kmer_pair()}; // Not found
-                        }
-                        
-                        const kmer_pair& current = local_data[slot];
-                        if (current.kmer == key) {
-                            return {true, current};
-                        }
-                    }
-                    return {false, kmer_pair()}; // Not found
-                },
-                distributed_map, key_kmer
-            ).wait();
-            
-            if (result.first) {
-                val_kmer = result.second;
-                return true;
-            }
-            return false;
+        auto result = find_async(key_kmer).wait();
+        if (result.first) {
+            val_kmer = result.second;
+            return true;
         }
-    }
-    
-    // Batch find with prefetching
-    std::vector<bool> find_batch(const std::vector<pkmer_t>& keys, std::vector<kmer_pair>& values) {
-        assert(keys.size() == values.size());
-        std::vector<bool> results(keys.size(), false);
-        
-        // First pass: do local lookups
-        for (size_t i = 0; i < keys.size(); i++) {
-            uint64_t hash = keys[i].hash();
-            int target_rank = hash % upcxx::rank_n();
-            
-            if (target_rank == upcxx::rank_me()) {
-                results[i] = find_local(keys[i], values[i]);
-            }
-        }
-        
-        // Second pass: group remote lookups by rank
-        std::map<int, std::vector<std::pair<size_t, pkmer_t>>> remote_lookups;
-        
-        for (size_t i = 0; i < keys.size(); i++) {
-            uint64_t hash = keys[i].hash();
-            int target_rank = hash % upcxx::rank_n();
-            
-            if (target_rank != upcxx::rank_me()) {
-                remote_lookups[target_rank].push_back({i, keys[i]});
-            }
-        }
-        
-        // Launch all remote lookups
-        std::vector<upcxx::future<std::vector<std::pair<size_t, std::pair<bool, kmer_pair>>>>> futures;
-        
-        for (const auto& [rank, lookups] : remote_lookups) {
-            futures.push_back(upcxx::rpc(
-                rank,
-                [](upcxx::dist_object<HashMapPart>& dmap, 
-                   std::vector<std::pair<size_t, pkmer_t>> batch) 
-                   -> std::vector<std::pair<size_t, std::pair<bool, kmer_pair>>> {
-                    
-                    std::vector<std::pair<size_t, std::pair<bool, kmer_pair>>> batch_results;
-                    batch_results.reserve(batch.size());
-                    
-                    // Get direct pointers for better performance
-                    kmer_pair* local_data = dmap->data.local();
-                    int* local_used = dmap->used.local();
-                    size_t size = dmap->size;
-                    
-                    for (const auto& [idx, key] : batch) {
-                        uint64_t hash = key.hash();
-                        uint64_t start_slot = (hash / upcxx::rank_n()) % size;
-                        bool found = false;
-                        kmer_pair value;
-                        
-                        for (uint64_t probe = 0; probe < size; probe++) {
-                            uint64_t slot = (start_slot + probe) % size;
-                            
-                            if (local_used[slot] == 0) {
-                                break; // Not found
-                            }
-                            
-                            const kmer_pair& current = local_data[slot];
-                            if (current.kmer == key) {
-                                found = true;
-                                value = current;
-                                break;
-                            }
-                        }
-                        
-                        batch_results.push_back({idx, {found, value}});
-                    }
-                    
-                    return batch_results;
-                },
-                distributed_map, lookups
-            ));
-        }
-        
-        // Wait for all futures and process results
-        for (auto& future : futures) {
-            auto batch_results = future.wait();
-            for (const auto& [idx, result] : batch_results) {
-                if (result.first) {
-                    values[idx] = result.second;
-                    results[idx] = true;
-                }
-            }
-        }
-        
-        return results;
+        return false;
     }
     
     void flush_insertions() {
-        flush_insertion_buffer();
+        flush_insertions_async();
+        for (auto& future : pending_insertions) {
+            future.wait();
+        }
+        pending_insertions.clear();
         upcxx::barrier();
     }
     
