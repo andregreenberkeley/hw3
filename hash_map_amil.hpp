@@ -172,7 +172,7 @@ struct HashMap {
         still_pending.reserve(pending_insertions.size());
         
         for (auto& future : pending_insertions) {
-            if (future.ready()) {
+            if (future.is_ready()) {
                 // This future is complete, nothing more to do
             } else {
                 still_pending.push_back(std::move(future));
@@ -255,14 +255,14 @@ struct HashMap {
     // Check if a specific find is complete
     bool is_find_ready(int id) {
         if (id >= 0 && id < pending_finds.size()) {
-            return pending_finds[id].future.ready();
+            return pending_finds[id].future.is_ready();
         }
         return false;
     }
     
     // Get result of a pending find
     std::optional<std::pair<bool, kmer_pair>> get_find_result(int id) {
-        if (id >= 0 && id < pending_finds.size() && pending_finds[id].future.ready()) {
+        if (id >= 0 && id < pending_finds.size() && pending_finds[id].future.is_ready()) {
             return pending_finds[id].future.wait();
         }
         return std::nullopt;
