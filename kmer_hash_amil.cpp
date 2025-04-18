@@ -18,42 +18,6 @@
 #include "read_kmers.hpp"
 #include "butil.hpp"
 
-// Enhanced cache structure for contig assembly
-struct LookupCache {
-    std::vector<std::pair<pkmer_t, kmer_pair>> entries;
-    size_t capacity;
-    size_t mask;
-    
-    LookupCache(size_t size) {
-        // Find next power of 2
-        capacity = 1;
-        while (capacity < size) capacity <<= 1;
-        mask = capacity - 1;
-        entries.resize(capacity);
-        clear();
-    }
-    
-    void clear() {
-        for (auto& entry : entries) {
-            entry.second = kmer_pair();
-        }
-    }
-    
-    bool find(const pkmer_t& key, kmer_pair& value) {
-        size_t idx = key.hash() & mask;
-        if (entries[idx].first == key && entries[idx].second.kmer == key) {
-            value = entries[idx].second;
-            return true;
-        }
-        return false;
-    }
-    
-    void insert(const pkmer_t& key, const kmer_pair& value) {
-        size_t idx = key.hash() & mask;
-        entries[idx] = {key, value};
-    }
-};
-
 // Optimized contig assembly function with overlapped communication
 std::list<std::list<kmer_pair>> assemble_contigs_overlapped(
     const std::vector<kmer_pair>& start_nodes,
@@ -62,7 +26,6 @@ std::list<std::list<kmer_pair>> assemble_contigs_overlapped(
     
     std::list<std::list<kmer_pair>> contigs;
     const int max_steps = 100000; // Prevent infinite loops
-    LookupCache cache(8192);  // Increased cache size
     
     // Process contigs in batches
     size_t batch_size = 64;  // Increased batch size
@@ -73,9 +36,6 @@ std::list<std::list<kmer_pair>> assemble_contigs_overlapped(
         // Track find operations for each contig
         std::vector<std::vector<int>> pending_find_ids(end - i);
         std::vector<bool> contig_done(end - i, false);
-        
-        // Clear cache between batches
-        cache.clear();
         
         // Initialize each contig with its start node
         for (size_t j = i; j < end; j++) {
@@ -101,23 +61,9 @@ std::list<std::list<kmer_pair>> assemble_contigs_overlapped(
                     // Get the next k-mer to find
                     pkmer_t next_key = contig.back().next_kmer();
                     
-                    // Check in cache first
-                    kmer_pair next_kmer;
-                    if (cache.find(next_key, next_kmer)) {
-                        // Found in cache, add to contig immediately
-                        contig.push_back(next_kmer);
-                        
-                        // Check if we're at the end of this contig
-                        if (contig.back().forwardExt() == 'F' || 
-                            contig.size() >= max_steps) {
-                            contig_done[contig_idx] = true;
-                            active_contigs--;
-                        }
-                    } else {
-                        // Not in cache, issue async find
-                        int find_id = hashmap.queue_find(next_key);
-                        pending_find_ids[contig_idx].push_back(find_id);
-                    }
+                    // Issue async find
+                    int find_id = hashmap.queue_find(next_key);
+                    pending_find_ids[contig_idx].push_back(find_id);
                 }
             }
             
@@ -146,8 +92,7 @@ std::list<std::list<kmer_pair>> assemble_contigs_overlapped(
                             auto [found, next_kmer] = result_opt.value();
                             
                             if (found) {
-                                // Add to cache and contig
-                                cache.insert(next_kmer.kmer, next_kmer);
+                                // Add to contig
                                 contig.push_back(next_kmer);
                                 
                                 // Check if we're at the end of this contig
